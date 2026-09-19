@@ -24,12 +24,15 @@ import onnxruntime as ort
 
 
 ARCHIVE_SHA256 = "f9191f30178cc9122ce2f023bf9fefafc822028307b0efa4caff645ba3fe8d0a"
+MANIFEST_SHA256 = "7e80f93f0e9b923c392424b0f85d28a717feee0a4d2a6aa9bfa723693868e727"
+MANIFEST_BYTES = 1867
 REVISION = "55a984d46f68323301837194ce647c702f55facc"
 ARCHIVE_ROOT = "sherpa-onnx-orukeet-v0.1.0-int8"
 ARCHIVE_URL = (
     f"https://huggingface.co/oruk/orukeet/resolve/{REVISION}/onnx/"
     f"{ARCHIVE_ROOT}.tar.bz2"
 )
+MANIFEST_URL = f"https://huggingface.co/oruk/orukeet/resolve/{REVISION}/onnx/manifest.json"
 SOURCE_FILES = {
     "encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx",
     "tokens.txt", "bpe.vocab", "LICENSE-WEIGHTS", "NOTICE.md",
@@ -40,6 +43,25 @@ VOCAB_SIZE = 8193  # 8192 SentencePiece tokens plus blank; five duration logits 
 def sha256(path):
     with Path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def read_release_manifest(path):
+    """Read bounded, checksum-pinned release metadata without network access."""
+    with Path(path).open("rb") as stream:
+        data = stream.read(MANIFEST_BYTES + 1)
+    if len(data) != MANIFEST_BYTES or hashlib.sha256(data).hexdigest() != MANIFEST_SHA256:
+        raise ValueError("Release manifest SHA256/size mismatch; use the pinned manifest in docs/PARAKEET.md")
+    manifest = json.loads(data)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("archive") != f"{ARCHIVE_ROOT}.tar.bz2"
+        or manifest.get("extract_dir") != ARCHIVE_ROOT
+        or manifest.get("archive_sha256") != ARCHIVE_SHA256
+        or type(manifest.get("archive_bytes")) is not int
+        or manifest["archive_bytes"] <= 0
+    ):
+        raise ValueError("Release manifest does not describe the pinned Orukeet archive")
+    return manifest
 
 
 def extract_archive(archive, destination):
@@ -183,11 +205,14 @@ def verify_combination(decoder_path, joiner_path, combined_path):
     return {"steps": 8, "max_abs_error": max_abs_error, "provider": "CPUExecutionProvider"}
 
 
-def import_archive(archive, output):
+def import_archive(archive, output, release_manifest):
     archive, output = Path(archive), Path(output)
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"Refusing to overwrite existing output: {output}")
-    if sha256(archive) != ARCHIVE_SHA256:
+    release = read_release_manifest(release_manifest)
+    if archive.stat().st_size != release["archive_bytes"]:
+        raise ValueError("Archive size mismatch; use the pinned release in docs/PARAKEET.md")
+    if sha256(archive) != release["archive_sha256"]:
         raise ValueError("Archive SHA256 mismatch; use the pinned release in docs/PARAKEET.md")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".orukeet-import-", dir=output.parent) as temporary:
@@ -214,6 +239,8 @@ def import_archive(archive, output):
             "model": "orukeet-r3-int8",
             "source_url": ARCHIVE_URL,
             "archive_sha256": ARCHIVE_SHA256,
+            "source_manifest_url": MANIFEST_URL,
+            "source_manifest_sha256": MANIFEST_SHA256,
             "weight_license": "CC-BY-SA-4.0",
             "conversion": "Encoder and vocabulary copied; decoder/joiner composed, I/O renamed; no requantization.",
             "tools": {"onnx": onnx.__version__, "onnxruntime": ort.__version__, "numpy": np.__version__},
@@ -234,10 +261,11 @@ def import_archive(archive, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path, required=True, help="Pinned Orukeet INT8 .tar.bz2")
+    parser.add_argument("--manifest", type=Path, required=True, help="Pinned publisher's ONNX manifest.json")
     parser.add_argument("--output", type=Path, required=True, help="New model directory; never overwritten")
     args = parser.parse_args()
     try:
-        manifest = import_archive(args.archive, args.output)
+        manifest = import_archive(args.archive, args.output, args.manifest)
     except (OSError, ValueError, tarfile.TarError, AssertionError) as error:
         parser.exit(1, f"Import failed: {error}\n")
     print(f"Imported Orukeet to {args.output}")

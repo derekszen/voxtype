@@ -227,9 +227,12 @@ the existing Parakeet interface, and copies the encoder and vocabulary unchanged
 It does not retrain or requantize the model. Python is needed only for this import;
 normal transcription uses Voxtype's existing CPU/ONNX runtime.
 
-Download the pinned r3 archive (about 487 MB):
+Download the pinned publisher manifest and r3 archive (about 487 MB):
 
 ```bash
+curl --fail --location --connect-timeout 10 --max-time 30 \
+  'https://huggingface.co/oruk/orukeet/resolve/55a984d46f68323301837194ce647c702f55facc/onnx/manifest.json' \
+  --output orukeet-release-manifest.json
 curl --fail --location \
   'https://huggingface.co/oruk/orukeet/resolve/55a984d46f68323301837194ce647c702f55facc/onnx/sherpa-onnx-orukeet-v0.1.0-int8.tar.bz2' \
   --output sherpa-onnx-orukeet-v0.1.0-int8.tar.bz2
@@ -240,13 +243,20 @@ From the Voxtype source checkout, import it with `uv` (Python 3.12 or newer):
 ```bash
 uv run --script scripts/import-orukeet-onnx.py \
   --archive sherpa-onnx-orukeet-v0.1.0-int8.tar.bz2 \
+  --manifest orukeet-release-manifest.json \
   --output "$HOME/.local/share/voxtype/models/orukeet-r3-int8"
 ```
 
-The importer verifies SHA256
-`f9191f30178cc9122ce2f023bf9fefafc822028307b0efa4caff645ba3fe8d0a`,
-refuses existing output directories, and checks eight decoder/joiner steps on
-CPU before publishing the converted directory. Logits and recurrent states must
+The importer verifies the release manifest's pinned byte count and SHA256, then
+uses its archive size and checksum to validate the local archive. The publisher
+requests this manifest download for Hugging Face download accounting. Conversion
+and transcription stay offline. Save the manifest with the archive for later
+offline imports.
+
+The pinned archive SHA256 is
+`f9191f30178cc9122ce2f023bf9fefafc822028307b0efa4caff645ba3fe8d0a`.
+The importer refuses existing output directories and checks eight decoder/joiner
+steps on CPU before publishing the converted directory. Logits and recurrent states must
 be finite in both the source and combined graphs, even when they otherwise match.
 Allow about 2 GB of temporary free disk space during import, in addition to the
 downloaded archive. A

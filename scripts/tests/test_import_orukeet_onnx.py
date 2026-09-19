@@ -1,6 +1,8 @@
 """Small CPU tests for the importer; no downloaded model or audio required."""
 
 import importlib.util
+from contextlib import contextmanager
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -95,7 +97,79 @@ def synthetic_archive(directory):
     return archive, files
 
 
+@contextmanager
+def release_manifest(directory, size, **overrides):
+    manifest = {
+        "archive": f"{importer.ARCHIVE_ROOT}.tar.bz2",
+        "extract_dir": importer.ARCHIVE_ROOT,
+        "archive_sha256": importer.ARCHIVE_SHA256,
+        "archive_bytes": size,
+    }
+    manifest.update(overrides)
+    data = json.dumps(manifest).encode()
+    path = directory / "release-manifest.json"
+    path.write_bytes(data)
+    with mock.patch.multiple(
+        importer, MANIFEST_BYTES=len(data), MANIFEST_SHA256=hashlib.sha256(data).hexdigest()
+    ):
+        yield path
+
+
 class ImportTests(unittest.TestCase):
+    def test_release_manifest_must_match_pinned_bytes_and_digest(self):
+        for mutation in (lambda data: data[:-1], lambda data: data + b"x",
+                         lambda data: b"x" + data[1:]):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with release_manifest(root, 10) as manifest:
+                    manifest.write_bytes(mutation(manifest.read_bytes()))
+                    with self.assertRaisesRegex(ValueError, "manifest SHA256/size mismatch"):
+                        importer.read_release_manifest(manifest)
+
+    def test_release_manifest_must_describe_the_selected_archive(self):
+        for metadata in (
+            {"archive": "other.tar.bz2"}, {"extract_dir": "../other"},
+            {"archive_sha256": "0" * 64}, {"archive_bytes": 0},
+            {"archive_bytes": -1}, {"archive_bytes": True}, {"archive_bytes": "10"},
+        ):
+            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with release_manifest(root, 10, **metadata) as manifest:
+                    with self.assertRaisesRegex(ValueError, "does not describe"):
+                        importer.read_release_manifest(manifest)
+
+    def test_release_manifest_read_is_bounded(self):
+        source = io.BytesIO(b"x" * (importer.MANIFEST_BYTES + 1000))
+        with mock.patch.object(Path, "open", return_value=mock.MagicMock()) as opened:
+            reader = opened.return_value.__enter__.return_value
+            reader.read.side_effect = source.read
+            with self.assertRaisesRegex(ValueError, "manifest SHA256/size mismatch"):
+                importer.read_release_manifest("manifest.json")
+            reader.read.assert_called_once_with(importer.MANIFEST_BYTES + 1)
+            self.assertEqual(source.tell(), importer.MANIFEST_BYTES + 1)
+
+    def test_invalid_manifest_fails_before_reading_archive_or_creating_output(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            manifest.write_bytes(b"invalid")
+            output = root / "new-parent" / "output"
+            with mock.patch.object(importer, "sha256") as hash_file:
+                with self.assertRaisesRegex(ValueError, "manifest SHA256/size mismatch"):
+                    importer.import_archive(root / "not-downloaded", output, manifest)
+            hash_file.assert_not_called()
+            self.assertFalse(output.parent.exists())
+
+    def test_manifest_archive_size_is_required_before_extraction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive, _ = synthetic_archive(root)
+            with release_manifest(root, archive.stat().st_size + 1) as manifest:
+                with self.assertRaisesRegex(ValueError, "Archive size mismatch"):
+                    importer.import_archive(archive, root / "output", manifest)
+            self.assertFalse((root / "output").exists())
+            self.assertEqual(list(root.glob(".orukeet-import-*")), [])
+
     def test_composition_preserves_logits_lengths_and_states_on_cpu(self):
         decoder, joiner = models()
         combined = importer.merge_decoder_joiner(decoder, joiner)
@@ -178,10 +252,11 @@ class ImportTests(unittest.TestCase):
                     output = root / "output"
                     with (
                         mock.patch.object(importer, "ARCHIVE_SHA256", importer.sha256(archive)),
+                        release_manifest(root, archive.stat().st_size) as manifest,
                         np.errstate(invalid="ignore"),
                         self.assertRaisesRegex(ValueError, f"Non-finite {output_name}"),
                     ):
-                        importer.import_archive(archive, output)
+                        importer.import_archive(archive, output, manifest)
                     self.assertFalse(output.exists())
                     self.assertEqual(list(root.glob(".orukeet-import-*")), [])
 
@@ -189,15 +264,16 @@ class ImportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             archive, output = Path(temporary) / "archive", Path(temporary) / "output"
             archive.write_bytes(b"not the pinned archive")
-            with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
-                importer.import_archive(archive, output)
+            with release_manifest(Path(temporary), archive.stat().st_size) as manifest:
+                with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
+                    importer.import_archive(archive, output, manifest)
             self.assertFalse(output.exists())
 
     def test_never_overwrites_existing_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             with self.assertRaises(FileExistsError):
-                importer.import_archive(output / "nonexistent-archive", output)
+                importer.import_archive(output / "nonexistent-archive", output, output / "manifest")
 
     def test_never_overwrites_dangling_output_link(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -205,7 +281,7 @@ class ImportTests(unittest.TestCase):
             output = root / "output"
             output.symlink_to(root / "missing")
             with self.assertRaises(FileExistsError):
-                importer.import_archive(root / "nonexistent-archive", output)
+                importer.import_archive(root / "nonexistent-archive", output, root / "manifest")
             self.assertTrue(output.is_symlink())
 
     def test_rejects_missing_and_duplicate_archive_members_before_extraction(self):
@@ -226,12 +302,15 @@ class ImportTests(unittest.TestCase):
             output = root / "output"
             archive_hash = importer.sha256(archive)
             with mock.patch.object(importer, "ARCHIVE_SHA256", archive_hash):
-                result = importer.import_archive(archive, output)
+                with release_manifest(root, archive.stat().st_size) as manifest:
+                    result = importer.import_archive(archive, output, manifest)
+                    self.assertEqual(result["source_manifest_sha256"], importer.sha256(manifest))
 
             recorded = json.loads((output / "VOXTYPE-CONVERSION.json").read_text())
             self.assertEqual(recorded, result)
             self.assertEqual(recorded["archive_sha256"], archive_hash)
             self.assertEqual(recorded["source_url"], importer.ARCHIVE_URL)
+            self.assertEqual(recorded["source_manifest_url"], importer.MANIFEST_URL)
             self.assertEqual(recorded["weight_license"], "CC-BY-SA-4.0")
             self.assertEqual(recorded["cpu_graph_parity"]["steps"], 8)
             self.assertEqual(recorded["cpu_graph_parity"]["max_abs_error"], 0.0)
@@ -259,12 +338,13 @@ class ImportTests(unittest.TestCase):
             output = root / "output"
             with (
                 mock.patch.object(importer, "ARCHIVE_SHA256", importer.sha256(archive)),
+                release_manifest(root, archive.stat().st_size) as manifest,
                 mock.patch.object(
                     importer, "verify_combination", side_effect=AssertionError("parity failure")
                 ),
                 self.assertRaisesRegex(AssertionError, "parity failure"),
             ):
-                importer.import_archive(archive, output)
+                importer.import_archive(archive, output, manifest)
             self.assertFalse(output.exists())
             self.assertEqual(list(root.glob(".orukeet-import-*")), [])
 
