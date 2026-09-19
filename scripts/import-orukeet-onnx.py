@@ -164,9 +164,13 @@ def verify_combination(decoder_path, joiner_path, combined_path):
             {"encoder_outputs": frame, "targets": targets, "target_length": length,
              "input_states_1": h, "input_states_2": c},
         )
-        for actual, reference in (
-            (logits, expected), (actual_h, next_h), (actual_c, next_c)
+        for name, actual, reference in (
+            ("logits", logits, expected),
+            ("hidden state", actual_h, next_h),
+            ("cell state", actual_c, next_c),
         ):
+            if not np.all(np.isfinite(actual)) or not np.all(np.isfinite(reference)):
+                raise ValueError(f"Non-finite {name} at parity step {step}")
             np.testing.assert_allclose(actual, reference, rtol=1e-5, atol=1e-5)
             max_abs_error = max(max_abs_error, float(np.max(np.abs(actual - reference))))
         np.testing.assert_array_equal(actual_length, pred_length)

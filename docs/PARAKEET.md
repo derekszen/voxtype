@@ -246,8 +246,10 @@ uv run --script scripts/import-orukeet-onnx.py \
 The importer verifies SHA256
 `f9191f30178cc9122ce2f023bf9fefafc822028307b0efa4caff645ba3fe8d0a`,
 refuses existing output directories, and checks eight decoder/joiner steps on
-CPU before publishing the converted directory. Allow about 2 GB of temporary
-free disk space during import, in addition to the downloaded archive. A
+CPU before publishing the converted directory. Logits and recurrent states must
+be finite in both the source and combined graphs, even when they otherwise match.
+Allow about 2 GB of temporary free disk space during import, in addition to the
+downloaded archive. A
 `VOXTYPE-CONVERSION.json` file records provenance, tool versions, file hashes,
 and the numerical check results. This check is not an ASR accuracy benchmark.
 

@@ -152,6 +152,39 @@ class ImportTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "token 0"):
                 importer.validate_vocab(path)
 
+    def test_nonfinite_graph_outputs_do_not_publish_model(self):
+        for filename, initializer_name, output_name in (
+            ("joiner.int8.onnx", "bias", "logits"),
+            ("decoder.int8.onnx", "one", "hidden state"),
+            ("decoder.int8.onnx", "two", "cell state"),
+        ):
+            for nonfinite in (np.nan, np.inf, -np.inf):
+                with (
+                    self.subTest(output=output_name, value=nonfinite),
+                    tempfile.TemporaryDirectory() as temporary,
+                ):
+                    root = Path(temporary)
+                    archive, files = synthetic_archive(root)
+                    model = onnx.load_model_from_string(files[filename])
+                    initializer = next(
+                        item for item in model.graph.initializer
+                        if item.name == initializer_name
+                    )
+                    initializer.CopyFrom(N.from_array(
+                        np.full_like(N.to_array(initializer), nonfinite), initializer_name
+                    ))
+                    files[filename] = model.SerializeToString()
+                    write_archive(archive, files.items())
+                    output = root / "output"
+                    with (
+                        mock.patch.object(importer, "ARCHIVE_SHA256", importer.sha256(archive)),
+                        np.errstate(invalid="ignore"),
+                        self.assertRaisesRegex(ValueError, f"Non-finite {output_name}"),
+                    ):
+                        importer.import_archive(archive, output)
+                    self.assertFalse(output.exists())
+                    self.assertEqual(list(root.glob(".orukeet-import-*")), [])
+
     def test_rejects_incorrect_archive_checksum_without_creating_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             archive, output = Path(temporary) / "archive", Path(temporary) / "output"
